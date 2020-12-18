@@ -23,15 +23,47 @@ THE SOFTWARE.
 """
 
 import os, time, socket, hashlib, hmac, threading, logging, random, inspect
-from bencode import bencode, bdecode
-from utils import encode_uint32, encode_ip, encode_connection, encode_nodes, AsyncTimeout
-from utils import decode_uint32, decode_ip, decode_connection, decode_nodes, start_thread, ThreadManager
-from krpc import KRPCPeer, KRPCError
+from .bencode import bencode, bdecode
+from .utils import encode_uint32, encode_ip, encode_connection, connection_expired, encode_nodes, AsyncTimeout
+from .utils import decode_uint32, decode_ip, decode_connection, decode_nodes, start_thread, ThreadManager
+from .krpc import KRPCPeer, KRPCError
+from .crc32c import crc32c
+
+
+def reachableFrom(a,b):
+	"Return true if the host that owns B is likely to be able to reach A"
+	if ":" in a:
+		if a.startswith("200:") or a.startswith("201:"):
+			if b.startswith("200:") or b.startswith("201:"):
+				return True
+			#This may be a bad assumption, but for now assume that anyone
+			#On our lan can reach mesh addresses if we can
+			if  b.startswith("fd") or b.split(".")[0] in {127, 192,10}:
+				return True
+		#Otherwise no ipv6 to ipv4
+		if not ":" in b:
+			#Assume any two machines on the LAN can talk to each other
+			#Even v4 to v6 because b probably also has a v6 addr.
+			if b.split(".")[0] in {127, 192,10}:
+				return True
+			return False
+		
+		#Assume LAN nodes can reach any WAN node we can, but not the other way around
+		if a.startswith("fd"):
+			if not b.startswith("fd"):
+				return False
+		return True
+	else:
+		if a.split(".")[0] in {'127', '192','10'}:
+			if not b.split(".")[0] in {'127', '192','10'}:
+				return False
+		return True
+
+
 
 # BEP #0042 - prefix is based on ip and last byte of the node id - 21 most significant bits must match
 #  * ip = ip address in string format eg. "127.0.0.1"
 def bep42_prefix(ip, crc32_salt, first_node_bits): # first_node_bits determines the last 3 bits
-	from crc32c import crc32c
 	ip_asint = decode_uint32(encode_ip(ip))
 	value = crc32c(bytearray(encode_uint32((ip_asint & 0x030f3fff) | ((crc32_salt & 0x7) << 29))))
 	return (value & 0xfffff800) | ((first_node_bits << 8) & 0x00000700)
@@ -54,9 +86,13 @@ class DHT_Node(object):
 		self.version = version
 		self.tokens = {} # tokens to gain write access to self.values
 		self.values = {}
+		#How many values have been stored
+		self.totalValues = 0
 		self.attempt = 0
 		self.pending = 0
 		self.last_ping = 0
+		self.discard_old()
+
 
 	def set_id(self, id):
 		self.id = id
@@ -65,6 +101,20 @@ class DHT_Node(object):
 	def __repr__(self):
 		return 'id:%s con:%15s:%-5d v:%20s c:%5s last:%.2f' % (hex(self.id_cmp), self.connection[0], self.connection[1],
 			repr(self.version), valid_id(self.id, self.connection), time.time() - self.last_ping)
+	
+	def discard_old(self,age=24*60*60):
+		torm = []
+		t=time.monotonic()-age
+		for i in self.values:
+			x = len(self.values[i])
+			print(i, self.values[i])
+			self.values[i] = [j for j in self.values[i]  if j[2]>t]
+			self.totalValues -= x-len(self.values[i])
+
+			if not self.values[i]:
+				torm.append(i)
+		for i in torm:
+			del self.values[i]
 
 
 # Trivial node list implementation
@@ -259,8 +309,10 @@ class DHT(object):
 			if b'id' in remote_args_dict:
 				self._nodes.register_node(source_connection, remote_args_dict[b'id'], rec.get(b'v'))
 			query = rec[b'q']
-			callback = self._reply_handler[query]
+
 			callback_kwargs = {}
+			#Here's where we look up the handler function
+			callback = self._reply_handler[query]
 			for arg in inspect.getargspec(callback).args[2:]:
 				arg_bytes = arg.encode('ascii')
 				if arg_bytes in remote_args_dict:
@@ -292,7 +344,9 @@ class DHT(object):
 		return {}
 
 	# Iterate KRPC function on closest nodes - query_fun(connection, id, search_value)
-	def _iter_krpc_search(self, query_fun, process_fun, search_value, timeout, retries):
+	#Nodefilter lets us filter which nodes, effectively letting us treat sets of nodes as
+	#a sub-dht and fild the closest in the set.
+	def _iter_krpc_search(self, query_fun, process_fun, search_value, timeout, retries,nodefilter=None):
 		id_cmp = decode_id(search_value)
 		(returned, used_connections, discovered_nodes) = (set(), {}, set())
 		while not self._threads.shutdown_in_progress():
@@ -303,7 +357,7 @@ class DHT(object):
 				return n and (n.connection not in blacklist_connections)
 			discovered_nodes = set(filter(valid_node, discovered_nodes))
 			def not_blacklisted(n):
-				return n.connection not in blacklist_connections
+				return (n.connection not in blacklist_connections) and nodefilter(n) if nodefilter else True
 			def sort_by_id(n):
 				return n.id_cmp ^ id_cmp
 			close_nodes = set(self._nodes.get_nodes(N = 20, expression = not_blacklisted, sorter = sort_by_id))
@@ -333,6 +387,8 @@ class DHT(object):
 					node.pending -= 1
 				for node_id, node_connection in decode_nodes(result.get(b'nodes', b'')):
 					discovered_nodes.add(self._nodes.register_node(node_connection, node_id))
+				for node_id, node_connection in decode_nodes6(result.get(b'nodes6', b'')):
+					discovered_nodes.add(self._nodes.register_node(node_connection, node_id))				
 				for tmp in process_fun(node, result):
 					if tmp not in returned:
 						returned.add(tmp)
@@ -358,6 +414,7 @@ class DHT(object):
 	#   (verbatim, async KRPC method)
 	def ping(self, target_connection, sender_id):
 		return self._krpc.send_krpc_query(target_connection, b'ping', id = sender_id)
+
 	#   (reply method)
 	def _ping(self, send_krpc_reply, id):
 		send_krpc_reply(id = self._node.id)
@@ -370,10 +427,15 @@ class DHT(object):
 			for node_id, node_connection in decode_nodes(result.get(b'nodes', b'')):
 				if node_id == search_id:
 					yield node_connection
+			for node_id, node_connection in decode_nodes6(result.get(b'nodes6', b'')):
+						if node_id == search_id:
+							yield node_connection
+
 		return self._iter_krpc_search(self.find_node, process_find_node, search_id, timeout, retries)
 	#   (verbatim, async KRPC method)
 	def find_node(self, target_connection, sender_id, search_id):
-		return self._krpc.send_krpc_query(target_connection, b'find_node', id = sender_id, target = search_id)
+		return self._krpc.send_krpc_query(target_connection, b'find_node', id = sender_id, target = search_id, want=['n4','n6'])
+	
 	#   (reply method)
 	def _find_node(self, send_krpc_reply, id, target):
 		id_cmp = decode_id(id)
@@ -381,8 +443,12 @@ class DHT(object):
 			return valid_id(n.id, n.connection)
 		def sort_by_id(n):
 			return n.id_cmp ^ id_cmp
-		send_krpc_reply(id = self._node.id, nodes = encode_nodes(self._nodes.get_nodes(N = 20,
-			expression = select_valid, sorter = sort_by_id)))
+			
+			nodes = (self._nodes.get_nodes(N = 8, expression = select_valid, sorter = sort_by_id)
+			nodes6 = [i for i in nodes if ":" in i.connection[0]]
+			nodes = [i for i in nodes if not ":" in i.connection[0]]
+
+		send_krpc_reply(id = self._node.id, nodes = encode_nodes(nodes), nodes6=encode_nodes(nodes6))
 	_reply_handler[b'find_node'] = _find_node
 
 	# get_peers methods
@@ -393,32 +459,63 @@ class DHT(object):
 				node.tokens[info_hash] = result[b'token'] # store token for subsequent announce_peer
 			for node_connection in map(decode_connection, result.get(b'values', b'')):
 				yield node_connection
-		return self._iter_krpc_search(self.get_peers, process_get_peers, info_hash, timeout, retries)
+
+		#Detect if a node is on a mesh VPN
+		def meshfilter(n):
+			return n.connection[0].startswith("200:") or n.connection[0].startswith("201:")
+
+		for i in  self._iter_krpc_search(self.get_peers, process_get_peers, info_hash, timeout, retries):
+			yield i
+
 	#   (verbatim, async KRPC method)
 	def get_peers(self, target_connection, sender_id, info_hash):
-		return self._krpc.send_krpc_query(target_connection, b'get_peers', id = sender_id, info_hash = info_hash)
+		return self._krpc.send_krpc_query(target_connection, b'get_peers', id = sender_id, info_hash = info_hash, want=['n4','n6'])
 	#   (reply method)
-	def _get_peers(self, send_krpc_reply, id, info_hash):
+
+	def _get_peers(self, send_krpc_reply, id, info_hash, want=''):
 		token = hmac.new(self._token_key, encode_ip(send_krpc_reply.connection[0]), hashlib.sha1).digest()
 		id_cmp = decode_id(id)
 		def select_valid(n):
-			return valid_id(n.id, n.connection)
+			#We don't send the other node anything they can't reach. We determine this with a heuristic
+			return valid_id(n.id, n.connection) and reachableFrom(n.connection[0], send_krpc_reply.connection[0])
 		def sort_by_id(n):
 			return n.id_cmp ^ id_cmp
-		reply_args = {'nodes': encode_nodes(self._nodes.get_nodes(N = 8, expression = select_valid, sorter = sort_by_id))}
-		if self._node.values.get(info_hash):
-			reply_args['values'] = list(map(encode_connection, self._node.values[info_hash]))
+		nodes = (self._nodes.get_nodes(N = 8, expression = select_valid, sorter = sort_by_id)
+		reply_args = {'nodes': encode_nodes([i for i in nodes if not ":" in i.connection[0]])
+					  'nodes6': encode_nodes([i for i in nodes if ":" in i.connection[0]])
+		}
+		x = self._node.values.get(info_hash)
+		if x:
+			#Don't send old connections and don't send things the other side can't reach.
+			x = [i for i in x if (not connection_expired(i) and reachableFrom(i[0][0], send_krpc_reply.connection[0])) ]
+		else:
+			x=[]
+
+		nodes =[]
+		if 'n6' in want:
+			nodes += [encode_connection(i) for i in x if ":" in i[0][0]]
+		if 'n4' in want:
+			nodes+= [encode_connection(i) for i in x if not ":" in i[0][0]]
+
+		reply_args['values'] = nodes
 		send_krpc_reply(id = self._node.id, token = token, **reply_args)
 	_reply_handler[b'get_peers'] = _get_peers
 
 	# announce_peer methods
 	#   (sync method, announcing to all nodes giving tokens)
 	def dht_announce_peer(self, info_hash, implied_port = 1):
+		id_cmp = decode_id(info_hash)
+		self.dht_get_peers(info_hash)
+		
 		def has_info_hash_token(node):
 			return info_hash in node.tokens
-		for node in self._nodes.get_nodes(expression = has_info_hash_token):
+		def sort_by_id(n):
+			return n.id_cmp ^ id_cmp
+
+		for node in self._nodes.get_nodes(N=8, expression = has_info_hash_token, sorter = sort_by_id):
 			yield self.announce_peer(node.connection, self._node.id, info_hash, self._node.connection[1],
 				node.tokens[info_hash], implied_port = implied_port)
+
 	#   (verbatim, async KRPC method)
 	def announce_peer(self, target_connection, sender_id, info_hash, port, token, implied_port = None):
 		req = {'id': sender_id, 'info_hash': info_hash, 'port': port, 'token': token}
@@ -431,56 +528,16 @@ class DHT(object):
 		if (local_token == token) and valid_id(id, send_krpc_reply.connection): # Validate token and ID
 			if implied_port:
 				port = send_krpc_reply.connection[1]
-			self._node.values.setdefault(info_hash, []).append((send_krpc_reply.connection[0], port))
+
+			#Putting this here for now. It iterates, so putting it with
+			#The code that adds to it makes sense, so they don't happen at once.
+			if self._node.totalValues>=1024*32:
+				self._node.discard_old()
+			#If we 
+			if self._node.totalValues<1024*32:
+				self._node.values.setdefault(info_hash, []).append((send_krpc_reply.connection[0], port,time.monotonic()))
+				self._node.totalValues +=1
+			
 			send_krpc_reply(id = self._node.id)
 	_reply_handler[b'announce_peer'] = _announce_peer
 
-
-if __name__ == '__main__':
-	logging.basicConfig()
-	log = logging.getLogger()
-	log.setLevel(logging.INFO)
-	logging.getLogger('DHT').setLevel(logging.INFO)
-	logging.getLogger('DHT_Router').setLevel(logging.ERROR)
-	logging.getLogger('KRPCPeer').setLevel(logging.ERROR)
-	logging.getLogger('KRPCPeer.local').setLevel(logging.ERROR)
-	logging.getLogger('KRPCPeer.remote').setLevel(logging.ERROR)
-
-	# Create a DHT swarm
-	setup = {}
-	bootstrap_connection = ('localhost', 10001)
-#	bootstrap_connection = ('router.bittorrent.com', 6881)
-	dht1 = DHT(('0.0.0.0', 10001), bootstrap_connection, setup)
-	dht2 = DHT(('0.0.0.0', 10002), bootstrap_connection, setup)
-	dht3 = DHT(('0.0.0.0', 10003), bootstrap_connection, setup)
-	dht4 = DHT(('0.0.0.0', 10004), ('localhost', 10003), setup)
-	dht5 = DHT(('0.0.0.0', 10005), ('localhost', 10003), setup)
-	dht6 = DHT(('0.0.0.0', 10006), ('localhost', 10005), setup)
-
-	log.critical('starting "ping" test')
-	log.critical('ping: dht1 -> bootstrap = %r' % dht1.dht_ping(bootstrap_connection))
-	log.critical('ping: dht6 -> bootstrap = %r' % dht6.dht_ping(bootstrap_connection))
-
-	log.critical('starting "find_node" test')
-	for idx, node in enumerate(dht3.dht_find_node(dht1._node.id)):
-		log.critical('find_node: dht3 -> id(dht1) result #%d: %s:%d' % (idx, node[0], node[1]))
-		if idx > 10:
-			break
-
-	import binascii
-	info_hash = binascii.unhexlify('ae3fa25614b753118931373f8feae64f3c75f5cd') # Ubuntu 15.10 info hash
-
-	log.critical('starting "get_peers" test')
-	for idx, peer in enumerate(dht5.dht_get_peers(info_hash)):
-		log.critical('get_peers: dht5 -> info_hash result #%d: %r' % (idx, peer))
-
-	log.critical('starting "announce_peer" test')
-	for idx, async_result in enumerate(dht5.dht_announce_peer(info_hash)):
-		log.critical('announce_peer: dht2 -> close_nodes(info_hash) #%d: %r' % (idx, async_result.get_result(1)))
-
-	log.critical('starting "get_peers" test')
-	for idx, peer in enumerate(dht1.dht_get_peers(info_hash)):
-		log.critical('get_peers: dht1 -> info_hash result #%d: %r' % (idx, peer))
-
-	for dht in [dht1, dht2, dht3, dht4, dht5, dht6]:
-		dht.shutdown()

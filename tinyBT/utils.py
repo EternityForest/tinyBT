@@ -26,6 +26,7 @@ import sys, select, socket, struct, threading, time, collections, logging
 
 client_version = (b'XK', 0, 0x01) # eXperimental Klient 0.0.1
 
+encode_ip6 = lambda value: socket.inet_pton(socket.AF_INET6,value)
 encode_ip = lambda value: socket.inet_aton(value)
 encode_uint16 = lambda value: struct.pack('!H', value)
 encode_uint32 = lambda value: struct.pack('!I', value)
@@ -33,7 +34,13 @@ encode_uint64 = lambda value: struct.pack('!Q', value)
 encode_int32 = lambda value: struct.pack('!i', value)
 
 def encode_connection(con):
-	return encode_ip(con[0]) + encode_uint16(con[1])
+	if not ":" in con[0]:
+		return encode_ip(con[0]) + encode_uint16(con[1])
+	else:
+		return encode_ip6(con[0]) + encode_uint16(con[1])
+
+def connection_expired(con):
+	return con[2] < time.monotonic()-24*60*60
 
 def encode_nodes(nodes):
 	result = b''
@@ -42,12 +49,16 @@ def encode_nodes(nodes):
 	return result
 
 decode_ip = lambda value: socket.inet_ntoa(value)
+decode_ip6 = lambda value: socket.inet_ntop(socket.AF_INET6,value)
 decode_uint16 = lambda value: struct.unpack('!H', value)[0]
 decode_uint32 = lambda value: struct.unpack('!I', value)[0]
 decode_uint64 = lambda value: struct.unpack('!Q', value)[0]
 
 def decode_connection(con):
-	return (decode_ip(con[0:4]), decode_uint16(con[4:6]))
+	if len(con)>6:
+		return (decode_ip6(con[0:16]), decode_uint16(con[16:18]))
+	else:
+		return (decode_ip(con[0:4]), decode_uint16(con[4:6]))
 
 def decode_nodes(nodes):
 	try:
@@ -59,6 +70,18 @@ def decode_nodes(nodes):
 			nodes = nodes[26:]
 	except Exception:
 		pass # catch malformed nodes
+
+def decode_nodes6(nodes):
+	try:
+		while nodes:
+			node_id = struct.unpack('20s', nodes[:20])[0]
+			node_connection = decode_connection(nodes[20:38])
+			if node_connection[1] >= 1024: # discard invalid port numbers
+				yield (node_id, node_connection)
+			nodes = nodes[38:]
+	except Exception:
+		pass # catch malformed nodes
+
 
 def start_thread(fun, *args, **kwargs):
 	thread = threading.Thread(name = repr(fun), target=fun, args=args, kwargs=kwargs)

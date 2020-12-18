@@ -20,9 +20,9 @@ if __name__ == '__main__':
 	dht4 = DHT(('0.0.0.0', 10004), ('localhost', 10003), setup)
 	dht5 = DHT(('0.0.0.0', 10005), ('localhost', 10003), setup)
 	dht6 = DHT(('0.0.0.0', 10006), ('localhost', 10005), setup)
-	dht7 = DHT(('::/0', 10006), ('localhost', 10005), setup)
-	dht8 = DHT(('::/0', 10006), ('localhost', 10005), setup)
-	dht9 = DHT(('::/0', 10006), ('localhost', 10005), setup)
+	dht7 = DHT(('::/0', 10007), ('localhost', 10005), setup)
+	dht8 = DHT(('::/0', 10008), ('localhost', 10005), setup)
+	dht9 = DHT(('::/0', 10009), ('localhost', 10005), setup)
 
 
 	log.critical('starting "ping" test')
